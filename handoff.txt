@@ -1,0 +1,228 @@
+For AI Agents: This file is documenting what each AI agent I have used has done. Please add on to the file as needed with Name and date
+
+
+
+
+Claude - 10/30/2026
+  HANDOFF: MakerBot Replicator Mini network printing plugin for Cura
+Written by Claude (Anthropic) for continuation in ChatGPT. Date: 2026-10-30.
+Repo: https://github.com/JZRod/MakerbotMiniCura  (plugin lives in MakerBotMiniPlugin/)
+
+======================================================================
+1. GOAL AND ENVIRONMENT
+======================================================================
+Slice in Ultimaker Cura 5.12.0 (Windows 11) and send the job over Wi-Fi to an ORIGINAL
+MakerBot Replicator Mini (MakerBot bot_type "mini_4", tool_type "mk13"), replacing MakerBot
+Desktop. The Mini does not run plain G-code; it needs a .makerbot ZIP archive containing a JSON
+toolpath, so the plugin must (a) convert Cura's G-code to .makerbot and (b) upload it and start
+the print using the printer's network protocol.
+
+Printer facts: build volume 100 x 100 x 125 mm, 0.4 mm nozzle, PLA, 1.77 mm filament in the
+reference file, no heated bed, coordinates centred on the bed.
+
+CURRENT SYMPTOM (the open problem): after slicing and pressing the start/print button, the printer
+does nothing. It has NOT been established which stage fails (see section 8).
+
+IMPORTANT: nothing has been run against a real printer or inside real Cura by me. Everything
+below was verified only against (a) a mock printer I wrote and (b) hand-written stubs of Cura's
+Python API. Treat every Cura API call and every protocol detail as unverified.
+
+======================================================================
+2. WHAT THE USER PROVIDED (ground truth)
+======================================================================
+- 3dprinter.makerbot  : a genuine MakerBot Desktop job for the Mini. THE SOURCE OF TRUTH.
+- 10-30.gcode         : Cura 5.12.0 G-code, Marlin flavour, corner origin (X/Y 32..68), 198
+                        layers, 0.1 mm layers, M104 S200, bed commands M140/M190 S60 (ignored),
+                        start gcode "G28 / G1 Z15 / prime E3 / G1 E-6.5".
+- 10-30_experimental.makerbot : output of the earlier ChatGPT converter (v0.3.0). It had
+                        extruder_temperature 0.0 and placeholder durations - not print-safe.
+- MakerBotMiniNetwork-Cura-0.3.0.zip : the earlier ChatGPT plugin. It only did UDP discovery,
+                        TCP port probes (80/443/9999), .makerbot inspection and an offline
+                        converter. It did NOT upload or start jobs.
+- ChatGPT's notes said a network capture of MakerBot Desktop showed TCP 9999 JSON-RPC with
+  print(filepath, transfer_wait=true) and put_init, but the full transfer/ack framing was unknown.
+
+======================================================================
+3. VERIFIED FACTS ABOUT THE .makerbot FORMAT (from 3dprinter.makerbot)
+======================================================================
+ZIP containing: print.jsontoolpath, meta.json, thumbnail_55x40.png, thumbnail_110x80.png,
+thumbnail_320x200.png.
+
+Reference toolpath: 6583 commands = 5766 move, 613 comment, 108 toggle_fan, 95 fan_duty,
+1 set_toolhead_temperature.
+
+Command shape: {"command": {"function": ..., "parameters": {...}, "tags": [...], "metadata": {...}}}
+- move parameters: x, y, z, a (cumulative extruder position, starts at 0), feedrate.
+  metadata = {"relative": {"a": false, "x": false, "y": false, "z": false}}  (ALL absolute)
+- feedrate is mm/s. VERIFIED: sum(distance/feedrate) = 466.7 s vs meta commanded_duration_s
+  471.8 (ratio 0.989). duration_s (888.8) is about 1.88x commanded_duration_s.
+- set_toolhead_temperature parameters: {"index": 0, "temperature": 215}  (first command in file)
+- toggle_fan parameters: {"index": 0, "value": true|false};  fan_duty: {"index": 0, "value": 0.5}
+- comment parameters: {"comment": "..."}; the file ends with comment "End of print".
+- Z only ever changes in PURE-Z moves, always at feedrate 23.0 (55 such moves). Max feedrate 150
+  (travel), min 0.5. Extruder-only moves: retract feed 50, restart feed 30.
+- Tags seen: Travel Move, Retract, Restart, Infill, Inset, Support, Connection,
+  "BeadMode External", "BeadMode Internal Thick", "Trailing Extrusion Move", "Leaky Travel Move".
+  Unknown whether the firmware uses tags; the plugin only emits Travel Move / Retract / Restart.
+- First commands of the reference: set temperature, then a move to (-59,-48,z=1.0, a=-0.5,
+  feed 50, tag Retract), then z down to 0.15 at feed 23, then layer comments, then travel to
+  the model. X/Y coordinates are centred on the bed (x range -59..13.98 in that file).
+  No homing/anchor commands appear in the toolpath; presumably the firmware homes and heats before
+  executing it (UNVERIFIED).
+
+meta.json keys in the reference (all kept by the plugin via a bundled template):
+bot_type, bounding_box, chamber_temperature, commanded_duration_s, duration_s,
+extruder_temperature, extruder_temperatures, extrusion_distance_mm, extrusion_distances_mm,
+extrusion_mass_g, extrusion_masses_g, grue_version ("5.8.1"), machine_config (big dict:
+acceleration limits, build_volume, extruder_profiles...), material, materials, miracle_config
+(big slicer config), model_counts, num_z_layers, num_z_transitions, platform_temperature,
+preferences, tool_type, tool_types, total_commands, uuid, version ("1.2.0").
+Fitted filament density: 1.24 g/cm^3 (mass 2.9327 g for 961.205 mm of 1.77 mm filament).
+
+======================================================================
+4. NETWORK PROTOCOL AS IMPLEMENTED (makerbot_rpc.py) - MOSTLY UNVERIFIED FOR THE MINI
+======================================================================
+Sources: reverse-engineered community projects - tjhorner/makerbot-rpc (Go),
+abdyfranco/makerbot-php, TrueAnalyticsSolutions/Mtconnect.MakerBotAdapter wiki (JSON-RPC method
+list). These target Gen 5 / Replicator+ firmware. Only the TCP 9999 print/put_init part is
+corroborated for the Mini by the user's capture.
+
+Pairing (HTTP port 80, GET /auth):
+  1. ?response_type=code&client_id=MakerWare&client_secret=secret&username=Cura
+       -> {"answer_code": "..."}
+  2. poll ?response_type=answer&client_id=MakerWare&client_secret=secret&answer_code=...
+       -> {"answer": "accepted", "code": "<auth_code>"} once the user accepts ON THE PRINTER
+          (knob/touchscreen). Can also be "rejected" or pending.
+  3. ?response_type=token&client_id=MakerWare&client_secret=secret&context=jsonrpc&auth_code=...
+       -> {"status": "success", "access_token": "..."}   (token is short-lived)
+JSON-RPC (TCP port 9999): bare JSON objects, no length prefix, no delimiter. The printer may send
+unsolicited notifications ("method": "state_notification"...) between replies; the client matches
+replies by id. Sequence used for a job:
+  handshake {} ->
+  authenticate {access_token} ->
+  print {filepath: "<name>.makerbot", transfer_wait: true} ->
+  process_method {method: "build_plate_cleared"} ->
+  put_init {block_size:100000, file_id:"1", file_path:"/current_thing/<name>.makerbot", length:N} ->
+  repeat: put_raw {file_id:"1", length:len(block)} then send the RAW BYTES on the same socket ->
+  put_term {crc: crc32(data), file_id:"1", length:N}
+This order is copied from tjhorner/makerbot-rpc (client.go Print()). The php project instead uses
+a different approach (external_print with a URL the printer downloads). If the Mini uses another
+flow, upload would fail or silently do nothing.
+Unverified details that could be the cause of the current symptom:
+  - Does the original Mini even have the HTTP /auth endpoint on port 80? (Check: browse to
+    http://<printer-ip>/auth?response_type=code&client_id=MakerWare&client_secret=secret )
+  - Does put_raw expect the raw bytes AFTER the JSON reply (my code reads the reply first, then
+    sends bytes) or immediately after the request? The Go client sends request, then bytes, and
+    only reads replies later through its subscriber. My client waits for a reply to put_raw
+    before sending the block - that may deadlock/time out on real firmware.
+  - Does the "print" call return an error if the printer is not idle / plate-clear prompt shown?
+  - Whether process_method(build_plate_cleared) is accepted at that point.
+  - Whether a "handshake" needs params {username, host_version}.
+
+======================================================================
+5. WHAT THE PLUGIN CONTAINS (repo layout)
+======================================================================
+MakerBotMiniPlugin/
+  plugin.json                  Cura plugin metadata (api 8, SDK 8.0.0 .. 8.13.0)
+  __init__.py                  register(): returns {"extension":..., "output_device":...};
+                               registers preferences and a resource search path
+  makerbot_rpc.py              pure-stdlib client: pair(), get_access_token(), RpcClient,
+                               upload_and_print(), discover() (mDNS, needs zeroconf),
+                               validate_host(), sanitize_filename()
+  makerbot_file.py             pure-stdlib converter: convert(), build_makerbot_file(),
+                               placeholder PNG thumbnails, bundled meta template loader
+  MakerBotMiniOutputDevice.py  Cura OutputDevice ("Print over network" button): collects G-code
+                               from scene.gcode_dict, converts, shows a "Start print" confirmation
+                               Message, uploads on a worker thread, reports progress/result
+  MakerBotMiniOutputDevicePlugin.py  registers the device only after pairing
+  MakerBotMiniExtension.py     Extensions > MakerBot Replicator Mini > Connect to printer...
+  MakerBotMiniManager.py       QObject for the QML dialog (IP field, Pair, Scan, Forget)
+  MakerBotMiniSettings.py      preferences makerbot_mini/ip and makerbot_mini/auth_code;
+                               call_on_main() via Application.functionEvent(CallFunctionEvent)
+  pair_printer.py              command-line pairing fallback (prints or writes cura.cfg values)
+  inspect_makerbot.py          dumps/compares .makerbot files, checks feedrate units
+  resources/definitions/makerbot_replicator_mini.def.json, resources/extruders/...def.json
+                               printer definition (100x100x125, centre origin, 1.77 filament)
+  resources/qml/ConnectDialog.qml
+  resources/mini_meta_template.json  meta.json copied from the user's reference file
+tests/  mock_printer.py (fake HTTP+TCP printer), test_core.py (converter + protocol),
+        test_cura_integration.py (stubs of UM/Cura/Qt), sample.gcode, cura_corner_origin.gcode
+Run: python -m unittest tests.test_core tests.test_cura_integration   (32 tests, all pass)
+
+======================================================================
+6. CONVERSION RULES IMPLEMENTED (makerbot_file.py)
+======================================================================
+- G0/G1 absolute and relative XYZ (G90/G91), E modes (M82/M83), G92 resets (E offset kept so
+  a stays cumulative), M104/M109 (first temperature wins; >240 C refused), M106/M107 fan
+  (S/255 -> fan_duty), M140/M190 ignored with a warning. Refused: G2/G3 arcs, G10/G11 firmware
+  retraction, moves outside +-50 mm XY / 0..125 Z, no temperature found.
+- Cura corner-origin G-code is shifted by x_offset=y_offset=-50 (output device sets this when
+  machine_center_is_zero is false; refuses if Cura bed size is not 100x100).
+- Everything before ";LAYER:0" (homing, Z15 move, prime, retract) is NOT sent. The toolpath
+  starts with set_toolhead_temperature, then a safe entry: move to first point at z=1.0 (feed 50),
+  lower to the layer z at 23 mm/s, then the print moves.
+- Moves with a Z change are split into pure-Z moves at 23 mm/s plus XY moves (matches reference).
+- Feedrate = F/60 mm/s, capped at 150; extruder-only moves capped at 50.
+- Ends with fan off (if on) and a comment "End of print".
+- meta.json: bundled reference template with computed values overwritten (bounding_box,
+  durations, temperatures, extrusion distance and mass, layer counts, total_commands, new uuid).
+- Result on the user's 10-30.gcode: 10,957 commands, x/y within +-17.8 mm, z 0.3..20,
+  sum(distance/feedrate) == commanded_duration_s (ratio 1.000), 198 z layers.
+- Thumbnails: tries Cura's Snapshot (cura.Snapshot) rendered via Qt; falls back to plain
+  generated placeholder PNGs. The Snapshot call is UNVERIFIED in real Cura.
+
+======================================================================
+7. UI FLOW AS DESIGNED
+======================================================================
+1) Extensions > MakerBot Replicator Mini > Connect to printer... -> enter IP -> Pair -> accept on
+   the printer -> auth code stored in Cura preferences. A "Print over network" output device then
+   appears (only when paired).
+2) Slice -> press "Print over network" -> converter runs -> a persistent message appears:
+   "Make sure the build plate is empty..." with buttons "Start print" / "Cancel".
+3) "Start print" -> worker thread runs upload_and_print(); progress message; success/failure
+   message.
+No file logging of RPC traffic exists yet.
+
+======================================================================
+8. THE OPEN PROBLEM AND HOW TO DIAGNOSE IT
+======================================================================
+Symptom: "printer doesn't really do anything after I slice and press start print".
+Unknown which of these happens (ask the user / add logging):
+  A. The "Print over network" button is not there -> device not registered (not paired, plugin
+     failed to load, or output device API mismatch).
+  B. The confirmation message never appears -> exception in requestWrite or a Message/API
+     mismatch (e.g. Message.addAction signature, actionTriggered signal, gcode_dict location,
+     Application.getMultiBuildPlateModel). Check Cura log (Help > Show Configuration Folder >
+     cura.log) for "MakerBot Mini" entries.
+  C. Message appears, "Start print" clicked, nothing visible -> the worker thread failed or the
+     message callbacks never ran on the main thread (Application.functionEvent may not exist or
+     behave as assumed in Cura 5.12 / Qt6), so errors are swallowed.
+  D. Upload "succeeds" but the printer ignores it -> wrong protocol sequence/file path/state.
+Suggested next steps:
+  1. Make the plugin write a verbose log file (every RPC request/response with timestamps, every
+     exception) to a known path, and show a Message on every stage and error.
+  2. Test the protocol OUTSIDE Cura with a standalone script (python pair_printer.py <ip>, then
+     a small script calling makerbot_rpc.upload_and_print with the reference .makerbot) so Cura
+     issues are separated from printer issues.
+  3. Capture MakerBot Desktop's exact TCP 9999 conversation (Wireshark, filter tcp.port==9999) while
+     it prints the reference file, and make makerbot_rpc.py reproduce it byte for byte
+     (especially: order of calls, params of handshake/print/put_init, when raw bytes are sent,
+     and what put_term/other acks look like). Also capture any HTTP on port 80.
+  4. Compare whether MakerBot Desktop uses external_print (URL) or put_* for the Mini.
+
+======================================================================
+9. SAFETY NOTES
+======================================================================
+Never auto-start prints: the confirmation about a clear build plate is deliberate. Converter has
+bounds checks and a 240 C cap. Treat the first real print as a supervised experiment (hand near
+the power switch). The earlier ChatGPT notes also said converted files should not be printed
+until validated; no converted file has been validated on hardware.
+
+======================================================================
+10. SOURCES CONSULTED
+======================================================================
+github.com/tjhorner/makerbot-rpc (client.go), github.com/abdyfranco/makerbot-php,
+github.com/TrueAnalyticsSolutions/Mtconnect.MakerBotAdapter (JSON-RPC wiki, mDNS service name
+_makerbot-jsonrpc._tcp), github.com/seeburger/convert_makerbot, github.com/xuhao1/gcode2dotmakebot
+(.makerbot structure), github.com/fieldOfView/Cura-OctoPrintPlugin (Cura output device pattern),
+Cura release notes (5.12.1 fixed .makerbot export for Method printers).
