@@ -1,0 +1,43 @@
+{
+    "version": 2,
+    "name": "MakerBot Replicator Mini",
+    "inherits": "fdmprinter",
+    "metadata":
+    {
+        "visible": true,
+        "author": "Community",
+        "manufacturer": "MakerBot",
+        "file_formats": "text/x-gcode",
+        "has_materials": false,
+        "has_machine_quality": false,
+        "preferred_quality_type": "normal",
+        "machine_extruder_trains":
+        {
+            "0": "makerbot_replicator_mini_extruder_0"
+        }
+    },
+    "overrides":
+    {
+        "machine_name": { "default_value": "MakerBot Replicator Mini" },
+        "machine_width": { "default_value": 100 },
+        "machine_depth": { "default_value": 100 },
+        "machine_height": { "default_value": 125 },
+        "machine_center_is_zero": { "default_value": true },
+        "machine_heated_bed": { "default_value": false },
+        "machine_gcode_flavor": { "default_value": "RepRap (RepRap)" },
+        "machine_nozzle_size": { "default_value": 0.4 },
+        "material_diameter": { "default_value": 1.77 },
+        "material_print_temperature": { "default_value": 215 },
+        "material_print_temperature_layer_0": { "default_value": 215 },
+        "layer_height": { "default_value": 0.2 },
+        "layer_height_0": { "default_value": 0.2 },
+        "speed_print": { "default_value": 50 },
+        "speed_travel": { "default_value": 100 },
+        "retraction_enable": { "default_value": true },
+        "retraction_amount": { "default_value": 1.0 },
+        "machine_firmware_retract": { "default_value": false },
+        "adhesion_type": { "default_value": "skirt" },
+        "machine_start_gcode": { "default_value": "G21\nG90\nM82\nG92 E0" },
+        "machine_end_gcode": { "default_value": "M107" }
+    }
+}
